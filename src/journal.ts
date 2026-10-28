@@ -1,6 +1,6 @@
 import { MatchingEngine } from "./engine.js";
 import { commandSchema, toCommand } from "./schema.js";
-import type { EngineEvent, OrderRequest } from "./types.js";
+import type { AmendRequest, EngineEvent, OrderRequest } from "./types.js";
 
 /**
  * Event-sourcing support. Every state change is driven by a command; because the engine
@@ -10,10 +10,18 @@ import type { EngineEvent, OrderRequest } from "./types.js";
 
 export type Command =
   | { readonly op: "submit"; readonly order: OrderRequest }
-  | { readonly op: "cancel"; readonly orderId: string };
+  | { readonly op: "cancel"; readonly orderId: string }
+  | { readonly op: "amend"; readonly orderId: string; readonly changes: AmendRequest };
 
 export function apply(engine: MatchingEngine, command: Command): EngineEvent[] {
-  return command.op === "submit" ? engine.submit(command.order) : engine.cancel(command.orderId);
+  switch (command.op) {
+    case "submit":
+      return engine.submit(command.order);
+    case "cancel":
+      return engine.cancel(command.orderId);
+    case "amend":
+      return engine.amend(command.orderId, command.changes);
+  }
 }
 
 export class Journal {

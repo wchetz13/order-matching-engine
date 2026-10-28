@@ -38,6 +38,12 @@ export interface RestingOrder {
 
 export type CancelReason = "user" | "ioc" | "fok" | "market-unfilled";
 
+/** Changes to a resting order. `quantity` is the new open (remaining) quantity. */
+export interface AmendRequest {
+  readonly price?: number;
+  readonly quantity?: number;
+}
+
 export type EngineEvent =
   | { readonly type: "accepted"; readonly orderId: string; readonly sequence: number }
   | { readonly type: "rejected"; readonly orderId: string; readonly reason: string }
@@ -61,6 +67,15 @@ export type EngineEvent =
       readonly orderId: string;
       readonly remaining: number;
       readonly reason: CancelReason;
+    }
+  | {
+      readonly type: "amended";
+      readonly orderId: string;
+      readonly price: number;
+      readonly previousRemaining: number;
+      readonly remaining: number;
+      /** False when the amend re-queued the order behind others at its price. */
+      readonly priorityKept: boolean;
     }
   | { readonly type: "filled"; readonly orderId: string };
 

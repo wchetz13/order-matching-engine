@@ -22,8 +22,9 @@ It processes about **2.3 million orders per second** on a single core with no ru
   | Market    | Takes liquidity, never rests     |
 
 - **O(1) cancels** from anywhere in a price level's queue, without disturbing the time priority of other orders.
+- **Amendments with exchange priority rules:** see [Amending orders](#amending-orders).
 - **Exact arithmetic:** prices are integer ticks and quantities are integer lots, so floating-point rounding can never create or destroy quantity.
-- **Event stream:** every command returns typed events: `accepted`, `rejected`, `trade`, `rested`, `cancelled`, `filled`.
+- **Event stream:** every command returns typed events: `accepted`, `rejected`, `trade`, `rested`, `amended`, `cancelled`, `filled`.
 - **Event sourcing:** commands are journaled as newline-delimited JSON. `replay()` rebuilds identical state, which serves as both crash recovery and an audit trail.
 - **HTTP API:** built on `node:http` with no framework. Request bodies are size-limited and schema-validated, with clear 400, 404, 413 and 422 semantics.
 
@@ -49,6 +50,20 @@ flowchart LR
 **Why a sorted array instead of a balanced tree for price levels?** Most activity happens within tens to hundreds of levels of the best price. At that size, a contiguous array's cache locality beats pointer-chasing in a red-black tree, and keeping the best price at the end makes the hot path (best price, remove an emptied level) O(1). A tree would only win for books with very many sparse levels; the `BookSide` interface hides the representation, so swapping it wouldn't touch the matching logic.
 
 **Determinism.** The engine reads no clocks and no randomness. Ordering comes from sequence numbers, and trade ids are counters. That's why event sourcing works: the same commands always produce the same events. A property test checks this on randomly generated order flow.
+
+## Amending orders
+
+`engine.amend(orderId, { price?, quantity? })` changes a resting order. `quantity` is the new _open_ quantity. Priority follows the rules most exchanges use:
+
+| Change                      | Queue priority | What happens                                                                   |
+| --------------------------- | -------------- | ------------------------------------------------------------------------------ |
+| Reduce quantity, same price | **Kept**       | Reduced in place, O(1)                                                         |
+| Increase quantity           | Lost           | Moved to the back of its price level                                           |
+| Change price                | Lost           | Moved to the new level; trades immediately if the new price crosses the spread |
+
+Reducing to zero isn't an amend (use `cancel`), and an amend that changes nothing is rejected. Each `amended` event records `previousRemaining`, `remaining`, and `priorityKept`, so downstream systems can see exactly what changed.
+
+The randomized property tests mix amendments into the order flow. They caught a real bug while this feature was being built. The journal parser rejected an empty amend, which the engine itself handles (by rejecting it), so a journal containing one couldn't be replayed. The fix keeps the project's rule: schemas validate _shape_, and the engine enforces _business rules_. Anything the engine can receive, the journal can replay.
 
 ## Quickstart
 
@@ -87,12 +102,13 @@ $ curl -s -X POST localhost:8080/orders \
 | GET    | `/health`        | Liveness and open order count                                                           |
 | GET    | `/book?depth=10` | Aggregated depth per side (1–100 levels)                                                |
 | POST   | `/orders`        | Submit an order. `200`, or `422` if the engine rejects it, or `400` for malformed input |
+| PATCH  | `/orders/:id`    | Amend with `{ "price"?, "quantity"? }`. `200`, `404` if unknown, `422` if rejected      |
 | DELETE | `/orders/:id`    | Cancel. `200`, or `404` if the order is unknown or already done                         |
 | GET    | `/journal`       | The full command log as NDJSON                                                          |
 
 ## Testing
 
-39 tests with 100% line and about 95% branch coverage. CI enforces minimum coverage thresholds.
+51 tests with 100% line and 96% branch coverage. CI enforces minimum coverage thresholds.
 
 - **Scenario tests:**
   - Price priority, then time priority.
@@ -100,11 +116,12 @@ $ curl -s -X POST localhost:8080/orders \
   - Sweeping multiple price levels.
   - IOC and FOK behavior, including FOK leaving the book untouched when it can't fill.
   - Cancelling from the middle of a queue.
+  - Amend priority rules, including re-pricing across the spread.
   - Removing a price level once it's empty.
   - Validation and duplicate ids.
 - **Property-based tests ([fast-check](https://fast-check.dev)):** these generate random streams of up to 200 mixed orders and cancels, then check that:
   - The book is never crossed (best bid < best ask) after any command.
-  - **Quantity is conserved:** for every order, traded + cancelled + resting = submitted.
+  - **Quantity is conserved:** for every order, traded + cancelled + resting = submitted + net amended quantity.
   - No trade happens at a price worse than either side's limit.
   - Serializing the journal to JSONL and replaying it reproduces **identical events and the identical book**.
 - **HTTP tests:** a real server on an ephemeral port, covering the happy paths, 400, 404, 413 and 422 errors, and journaling.

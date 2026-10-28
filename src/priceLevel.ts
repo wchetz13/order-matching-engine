@@ -46,7 +46,7 @@ export class PriceLevel {
   }
 
   /** Reduce an order's remaining quantity, keeping the level total in sync. */
-  fill(node: OrderNode, quantity: number): void {
+  reduce(node: OrderNode, quantity: number): void {
     node.order.remaining -= quantity;
     this.quantity -= quantity;
   }

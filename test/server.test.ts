@@ -59,6 +59,21 @@ describe("HTTP API", () => {
     expect((await call("DELETE", "/orders/a")).status).toBe(404);
   });
 
+  it("amends orders and maps rejections to status codes", async () => {
+    await call("POST", "/orders", order("a", "buy", 99, 5));
+    const reduced = await call("PATCH", "/orders/a", { quantity: 2 });
+    expect(reduced.status).toBe(200);
+    expect(JSON.stringify(reduced.body)).toContain('"priorityKept":true');
+    expect((await call("GET", "/book")).body).toMatchObject({
+      bids: [{ price: 99, quantity: 2, orders: 1 }],
+    });
+    expect((await call("PATCH", "/orders/a", { quantity: 2 })).status).toBe(422);
+    expect((await call("PATCH", "/orders/missing", { quantity: 1 })).status).toBe(404);
+    // An empty amend is well-formed, so the engine (not the schema) rejects it.
+    expect((await call("PATCH", "/orders/a", {})).status).toBe(422);
+    expect((await call("PATCH", "/orders/a", { size: 1 })).status).toBe(400);
+  });
+
   it("records every command in the journal", async () => {
     await call("POST", "/orders", order("a", "buy", 99, 1));
     await call("DELETE", "/orders/a");
