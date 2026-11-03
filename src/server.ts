@@ -1,8 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { MatchingEngine } from "./engine.js";
+import { MatchingEngine, UNKNOWN_ORDER } from "./engine.js";
 import { apply, type Command, Journal } from "./journal.js";
-import { orderRequestSchema, toOrderRequest } from "./schema.js";
+import type { EngineEvent } from "./types.js";
+import {
+  amendRequestSchema,
+  orderRequestSchema,
+  toAmendRequest,
+  toOrderRequest,
+} from "./schema.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_DEPTH = 100;
@@ -23,6 +29,7 @@ class HttpError extends Error {
  *   GET    /health
  *   GET    /book?depth=10
  *   POST   /orders          body: OrderRequest
+ *   PATCH  /orders/:id      body: { price?, quantity? }
  *   DELETE /orders/:id
  *   GET    /journal         newline-delimited JSON of all commands
  */
@@ -66,13 +73,21 @@ export function createApp(engine = new MatchingEngine(), journal = new Journal()
       if (!parsed.success)
         throw new HttpError(400, parsed.error.issues[0]?.message ?? "invalid order");
       const events = execute({ op: "submit", order: toOrderRequest(parsed.data) });
-      send(res, events[0]?.type === "rejected" ? 422 : 200, { events });
+      send(res, statusFor(events), { events });
       return;
     }
-    const cancel = /^\/orders\/([^/]+)$/.exec(path);
-    if (req.method === "DELETE" && cancel?.[1]) {
-      const events = execute({ op: "cancel", orderId: decodeURIComponent(cancel[1]) });
-      send(res, events[0]?.type === "rejected" ? 404 : 200, { events });
+    const orderPath = /^\/orders\/([^/]+)$/.exec(path);
+    const orderId = orderPath?.[1] && decodeURIComponent(orderPath[1]);
+    if (orderId && req.method === "DELETE") {
+      const events = execute({ op: "cancel", orderId });
+      send(res, statusFor(events), { events });
+      return;
+    }
+    if (orderId && req.method === "PATCH") {
+      const parsed = amendRequestSchema.safeParse(await readJson(req));
+      if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message ?? "invalid");
+      const events = execute({ op: "amend", orderId, changes: toAmendRequest(parsed.data) });
+      send(res, statusFor(events), { events });
       return;
     }
     throw new HttpError(404, "not found");
@@ -92,6 +107,13 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   } catch {
     throw new HttpError(400, "body must be valid JSON");
   }
+}
+
+/** 404 for an unknown order, 422 for any other rejection, 200 otherwise. */
+function statusFor(events: EngineEvent[]): number {
+  const first = events[0];
+  if (first?.type !== "rejected") return 200;
+  return first.reason === UNKNOWN_ORDER ? 404 : 422;
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {

@@ -1,6 +1,7 @@
 import { BookSide } from "./bookSide.js";
 import type { OrderNode, PriceLevel } from "./priceLevel.js";
 import type {
+  AmendRequest,
   BookSnapshot,
   EngineEvent,
   LevelSnapshot,
@@ -9,6 +10,8 @@ import type {
   Side,
   TimeInForce,
 } from "./types.js";
+
+export const UNKNOWN_ORDER = "unknown or inactive order";
 
 interface LiveOrder {
   readonly node: OrderNode;
@@ -53,7 +56,14 @@ export class MatchingEngine {
       return events;
     }
 
-    const remaining = this.match(request, opposite, limit, events);
+    const remaining = this.match(
+      request.id,
+      request.side,
+      request.quantity,
+      opposite,
+      limit,
+      events,
+    );
 
     if (remaining === 0) {
       events.push({ type: "filled", orderId: request.id });
@@ -80,10 +90,60 @@ export class MatchingEngine {
 
   cancel(orderId: string): EngineEvent[] {
     const live = this.live.get(orderId);
-    if (!live) return [{ type: "rejected", orderId, reason: "unknown or inactive order" }];
+    if (!live) return [{ type: "rejected", orderId, reason: UNKNOWN_ORDER }];
     const { remaining } = live.node.order;
     this.unlink(live);
     return [{ type: "cancelled", orderId, remaining, reason: "user" }];
+  }
+
+  /**
+   * Change a resting order's price and/or open quantity, following standard exchange
+   * priority rules:
+   *
+   * - Reducing quantity at the same price keeps the order's place in the queue.
+   * - Any price change or quantity increase loses priority: the order is re-sequenced as if
+   *   newly arrived, and if the new price crosses the spread it trades immediately.
+   */
+  amend(orderId: string, changes: AmendRequest): EngineEvent[] {
+    const live = this.live.get(orderId);
+    if (!live) return [{ type: "rejected", orderId, reason: UNKNOWN_ORDER }];
+    const order = live.node.order;
+    const price = changes.price ?? order.price;
+    const quantity = changes.quantity ?? order.remaining;
+    const rejection = !isPositiveInteger(price)
+      ? "price must be a positive integer number of ticks"
+      : !isPositiveInteger(quantity)
+        ? "quantity must be a positive integer; use cancel to remove an order"
+        : price === order.price && quantity === order.remaining
+          ? "amend changes nothing"
+          : undefined;
+    if (rejection) return [{ type: "rejected", orderId, reason: rejection }];
+
+    const previousRemaining = order.remaining;
+    const amended = {
+      type: "amended" as const,
+      orderId,
+      price,
+      previousRemaining,
+      remaining: quantity,
+    };
+    if (price === order.price && quantity < previousRemaining) {
+      live.level.reduce(live.node, previousRemaining - quantity);
+      return [{ ...amended, priorityKept: true }];
+    }
+
+    this.unlink(live);
+    const sequence = ++this.sequence;
+    const events: EngineEvent[] = [{ ...amended, priorityKept: false }];
+    const opposite = order.side === "buy" ? this.asks : this.bids;
+    const remaining = this.match(orderId, order.side, quantity, opposite, price, events);
+    if (remaining === 0) {
+      events.push({ type: "filled", orderId });
+    } else {
+      this.rest({ ...order, price, remaining, sequence });
+      events.push({ type: "rested", orderId, price, remaining });
+    }
+    return events;
   }
 
   snapshot(depth = 10): BookSnapshot {
@@ -118,30 +178,32 @@ export class MatchingEngine {
 
   /** Walk the opposite side best-first, filling against makers in FIFO order. */
   private match(
-    request: OrderRequest,
+    takerId: string,
+    side: Side,
+    quantity: number,
     opposite: BookSide,
     limit: number | undefined,
     events: EngineEvent[],
   ): number {
-    let remaining = request.quantity;
+    let remaining = quantity;
     while (remaining > 0) {
       const level = opposite.best();
-      if (!level || !crosses(request.side, limit, level.price)) break;
+      if (!level || !crosses(side, limit, level.price)) break;
 
       while (remaining > 0 && level.head) {
         const makerNode = level.head;
         const maker = makerNode.order;
-        const quantity = Math.min(remaining, maker.remaining);
-        level.fill(makerNode, quantity);
-        remaining -= quantity;
+        const traded = Math.min(remaining, maker.remaining);
+        level.reduce(makerNode, traded);
+        remaining -= traded;
         events.push({
           type: "trade",
           tradeId: ++this.tradeId,
           price: level.price,
-          quantity,
-          takerOrderId: request.id,
+          quantity: traded,
+          takerOrderId: takerId,
           makerOrderId: maker.id,
-          takerSide: request.side,
+          takerSide: side,
         });
         if (maker.remaining === 0) {
           level.remove(makerNode);

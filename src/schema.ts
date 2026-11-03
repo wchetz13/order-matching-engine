@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import type { Command } from "./journal.js";
-import type { OrderRequest } from "./types.js";
+import type { AmendRequest, OrderRequest } from "./types.js";
 
 /**
  * Wire-format schemas. These check shape and types at the system boundary;
@@ -32,9 +32,14 @@ export const orderRequestSchema = z.discriminatedUnion("type", [
     .strict(),
 ]);
 
+export const amendRequestSchema = z
+  .object({ price: z.number().optional(), quantity: z.number().optional() })
+  .strict();
+
 export const commandSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("submit"), order: orderRequestSchema }).strict(),
   z.object({ op: z.literal("cancel"), orderId: z.string() }).strict(),
+  z.object({ op: z.literal("amend"), orderId: z.string(), changes: amendRequestSchema }).strict(),
 ]);
 
 /** Convert parsed wire data to the engine's types, dropping absent optional fields. */
@@ -46,6 +51,20 @@ export function toOrderRequest(data: z.infer<typeof orderRequestSchema>): OrderR
   return data as OrderRequest;
 }
 
+export function toAmendRequest(data: z.infer<typeof amendRequestSchema>): AmendRequest {
+  return {
+    ...(data.price !== undefined && { price: data.price }),
+    ...(data.quantity !== undefined && { quantity: data.quantity }),
+  };
+}
+
 export function toCommand(data: z.infer<typeof commandSchema>): Command {
-  return data.op === "submit" ? { op: "submit", order: toOrderRequest(data.order) } : data;
+  switch (data.op) {
+    case "submit":
+      return { op: "submit", order: toOrderRequest(data.order) };
+    case "amend":
+      return { op: "amend", orderId: data.orderId, changes: toAmendRequest(data.changes) };
+    case "cancel":
+      return data;
+  }
 }

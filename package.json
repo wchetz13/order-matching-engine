@@ -1,6 +1,6 @@
 {
   "name": "order-matching-engine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic limit order book matching engine with price-time priority, event-sourced replay, and an HTTP API.",
   "license": "MIT",
   "author": "William Hetzinger <wchetzinger11@gmail.com>",

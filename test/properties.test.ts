@@ -14,6 +14,7 @@ const commandsArb = fc
     fc.oneof(
       { weight: 6, arbitrary: fc.constant("submit" as const) },
       { weight: 1, arbitrary: fc.constant("cancel" as const) },
+      { weight: 2, arbitrary: fc.constant("amend" as const) },
     ),
     { maxLength: 200 },
   )
@@ -22,20 +23,35 @@ const commandsArb = fc
       ...ops.map((op, i) =>
         op === "cancel"
           ? fc.nat({ max: Math.max(i - 1, 0) }).map((j): Command => ({ op, orderId: `o${j}` }))
-          : fc
-              .record({
-                side: fc.constantFrom("buy" as const, "sell" as const),
-                price: fc.integer({ min: 95, max: 105 }),
-                quantity: fc.integer({ min: 1, max: 20 }),
-                kind: fc.constantFrom("GTC", "IOC", "FOK", "market"),
-              })
-              .map(({ side, price, quantity, kind }): Command => ({
-                op: "submit",
-                order:
-                  kind === "market"
-                    ? { type: "market", id: `o${i}`, side, quantity }
-                    : { type: "limit", id: `o${i}`, side, price, quantity, timeInForce: kind },
-              })),
+          : op === "amend"
+            ? fc
+                .record({
+                  target: fc.nat({ max: Math.max(i - 1, 0) }),
+                  price: fc.option(fc.integer({ min: 95, max: 105 }), { nil: undefined }),
+                  quantity: fc.option(fc.integer({ min: 1, max: 20 }), { nil: undefined }),
+                })
+                .map(({ target, price, quantity }): Command => ({
+                  op,
+                  orderId: `o${target}`,
+                  changes: {
+                    ...(price !== undefined && { price }),
+                    ...(quantity !== undefined && { quantity }),
+                  },
+                }))
+            : fc
+                .record({
+                  side: fc.constantFrom("buy" as const, "sell" as const),
+                  price: fc.integer({ min: 95, max: 105 }),
+                  quantity: fc.integer({ min: 1, max: 20 }),
+                  kind: fc.constantFrom("GTC", "IOC", "FOK", "market"),
+                })
+                .map(({ side, price, quantity, kind }): Command => ({
+                  op: "submit",
+                  order:
+                    kind === "market"
+                      ? { type: "market", id: `o${i}`, side, quantity }
+                      : { type: "limit", id: `o${i}`, side, price, quantity, timeInForce: kind },
+                })),
       ),
     ),
   );
@@ -61,7 +77,7 @@ describe("invariants under random order flow", () => {
     );
   });
 
-  it("conserves quantity: every lot is traded, resting, or cancelled", () => {
+  it("conserves quantity: every lot is traded, resting, cancelled, or amended away", () => {
     fc.assert(
       fc.property(commandsArb, (commands) => {
         const { engine, events } = replay(commands);
@@ -77,7 +93,13 @@ describe("invariants under random order flow", () => {
             .filter((e) => e.type === "cancelled" && e.orderId === id)
             .reduce((s, e) => s + (e.type === "cancelled" ? e.remaining : 0), 0);
           const resting = engine.getOrder(id)?.remaining ?? 0;
-          expect(traded + cancelled + resting).toBe(command.order.quantity);
+          const amendedBy = events.reduce(
+            (s, e) =>
+              s +
+              (e.type === "amended" && e.orderId === id ? e.remaining - e.previousRemaining : 0),
+            0,
+          );
+          expect(traded + cancelled + resting).toBe(command.order.quantity + amendedBy);
         }
       }),
     );
@@ -86,13 +108,26 @@ describe("invariants under random order flow", () => {
   it("never trades through a limit price", () => {
     fc.assert(
       fc.property(commandsArb, (commands) => {
+        // Limits change over time with amends, so track them as events stream by.
+        const sides = new Map<string, string>();
+        for (const c of commands) if (c.op === "submit") sides.set(c.order.id, c.order.side);
         const limits = new Map<string, { side: string; price: number }>();
-        for (const c of commands) {
-          if (c.op === "submit" && c.order.type === "limit") {
-            limits.set(c.order.id, { side: c.order.side, price: c.order.price });
-          }
-        }
+        const submitted = new Map(
+          commands.flatMap((c) => (c.op === "submit" ? [[c.order.id, c.order] as const] : [])),
+        );
         for (const event of replay(commands).events) {
+          if (event.type === "accepted") {
+            const order = submitted.get(event.orderId);
+            if (order?.type === "limit") {
+              limits.set(order.id, { side: order.side, price: order.price });
+            }
+          }
+          if (event.type === "amended") {
+            limits.set(event.orderId, {
+              side: sides.get(event.orderId) ?? "",
+              price: event.price,
+            });
+          }
           if (event.type !== "trade") continue;
           for (const id of [event.takerOrderId, event.makerOrderId]) {
             const order = limits.get(id);

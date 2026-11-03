@@ -190,3 +190,76 @@ describe("validation", () => {
     expect(events[0]).toMatchObject({ type: "rejected", reason: "duplicate order id" });
   });
 });
+
+describe("amend", () => {
+  it("keeps queue priority when only reducing quantity", () => {
+    limit("sell", 100, 5); // o1
+    limit("sell", 100, 5); // o2
+    expect(engine.amend("o1", { quantity: 2 })).toEqual([
+      {
+        type: "amended",
+        orderId: "o1",
+        price: 100,
+        previousRemaining: 5,
+        remaining: 2,
+        priorityKept: true,
+      },
+    ]);
+    expect(engine.snapshot().asks).toEqual([{ price: 100, quantity: 7, orders: 2 }]);
+    expect(trades(limit("buy", 100, 3)).map((t) => [t.maker, t.quantity])).toEqual([
+      ["o1", 2],
+      ["o2", 1],
+    ]);
+  });
+
+  it("loses priority when increasing quantity", () => {
+    limit("sell", 100, 1); // o1
+    limit("sell", 100, 1); // o2
+    expect(engine.amend("o1", { quantity: 3 })[0]).toMatchObject({ priorityKept: false });
+    expect(trades(limit("buy", 100, 2)).map((t) => t.maker)).toEqual(["o2", "o1"]);
+  });
+
+  it("moves the order to a new price level and back of its queue", () => {
+    limit("buy", 99, 1); // o1
+    limit("buy", 98, 1); // o2
+    engine.amend("o1", { price: 98 });
+    expect(engine.snapshot().bids).toEqual([{ price: 98, quantity: 2, orders: 2 }]);
+    expect(trades(limit("sell", 98, 1)).map((t) => t.maker)).toEqual(["o2"]);
+  });
+
+  it("trades immediately when re-priced across the spread", () => {
+    limit("sell", 101, 2); // o1
+    limit("buy", 99, 5); // o2
+    const events = engine.amend("o2", { price: 101 });
+    expect(trades(events)).toEqual([{ price: 101, quantity: 2, maker: "o1" }]);
+    expect(events.at(-1)).toEqual({ type: "rested", orderId: "o2", price: 101, remaining: 3 });
+    expect(engine.bestBid()).toBe(101);
+    expect(engine.bestAsk()).toBeUndefined();
+  });
+
+  it("reports a full fill when the re-priced order is consumed", () => {
+    limit("sell", 101, 5);
+    limit("buy", 99, 2);
+    const events = engine.amend("o2", { price: 102 });
+    expect(trades(events)).toEqual([{ price: 101, quantity: 2, maker: "o1" }]);
+    expect(events.at(-1)).toEqual({ type: "filled", orderId: "o2" });
+    expect(engine.getOrder("o2")).toBeUndefined();
+  });
+
+  it.each([
+    [{ quantity: 0 }, "use cancel"],
+    [{ quantity: 2.5 }, "quantity"],
+    [{ price: 0 }, "price"],
+    [{ price: 100, quantity: 5 }, "changes nothing"],
+  ])("rejects %o", (changes, reason) => {
+    limit("buy", 100, 5);
+    const [event] = engine.amend("o1", changes);
+    expect(event).toMatchObject({ type: "rejected" });
+    expect(JSON.stringify(event)).toContain(reason);
+    expect(engine.getOrder("o1")?.remaining).toBe(5);
+  });
+
+  it("rejects unknown orders", () => {
+    expect(engine.amend("missing", { quantity: 1 })[0]).toMatchObject({ type: "rejected" });
+  });
+});
